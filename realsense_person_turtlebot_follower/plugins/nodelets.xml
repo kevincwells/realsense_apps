@@ -1,0 +1,7 @@
+<library path="lib/librealsense_person_turtlebot_follower">
+  <class name="realsense_person_turtlebot_follower/RealSensePersonCoM" type="realsense_person_turtlebot_follower::RealSensePersonCoM" base_class_type="nodelet::Nodelet">
+    <description>
+      The RealSense Person Center of Mass tracking nodelet used by Turtlebot Follower.
+    </description>
+  </class>
+</library> 
