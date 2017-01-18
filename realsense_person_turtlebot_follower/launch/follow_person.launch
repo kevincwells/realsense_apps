@@ -5,18 +5,20 @@
   <!-- Realsense Person Tracking -->
   <include file="$(find realsense_person)/launch/person_sample.launch">
 	<arg name="manager" value="camera_nodelet_manager"/>
+	<arg name="enable_skeleton_joints" value="true"/>
   </include>
   
   <!-- Turtlebot Follower -->
   <include file="$(find turtlebot_follower)/launch/follower.launch">
 	<arg name="generate_goal" value="false"/>
   </include>
+  <param name="turtlebot_follower/goal_z" value="1.2"/>
   
   <!-- Realsense Person Center of Mass goal publisher nodelet -->
   <node pkg="nodelet" type="nodelet" name="realsense_person_com"
         args="load realsense_person_turtlebot_follower/RealSensePersonCoM camera/camera_nodelet_manager">
     <remap from="realsense_person_com/goal" to="turtlebot_follower/goal"/>
-    <param name="max_z" value="1.6" />
+    <param name="max_z" value="1.8" />
   </node>
   
 </launch>

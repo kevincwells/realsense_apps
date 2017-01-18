@@ -34,6 +34,9 @@
 #include <visualization_msgs/Marker.h>
 #include <turtlebot_msgs/SetFollowState.h>
 #include <realsense_person/PersonDetection.h>
+#include <realsense_person/PersonTracking.h>
+#include <realsense_person/StartTracking.h>
+#include <realsense_person/StopTracking.h>
 #include "dynamic_reconfigure/server.h"
 #include "realsense_person_turtlebot_follower/RealSensePersonCoMConfig.h"
 
@@ -69,6 +72,11 @@ public:
 private:
   bool enabled_; /**< Enable/disable following; */
   double max_z_; /**< The maximum z position of the points in the box. */
+  bool enable_gesture_stop_;  /**< Enable/disable stopping Turtlebot via gesture */
+  bool gesture_tracking_enabled_; /**< Whether the gesture tracking service has been started */
+  bool gesture_detected_;  /**< The state of the gesture detection */
+  ros::Time gesture_time_;  /**< The time at which a new gesture state was detected. Used to eliminate false positives */
+  int gesture_change_duration_ = 1;  /**< How long a new gesture needs to be seen before state change. Used to eliminate false positives */
 
   // Dynamic reconfigure server
   dynamic_reconfigure::Server<realsense_person_turtlebot_follower::RealSensePersonCoMConfig>* config_srv_;
@@ -84,14 +92,21 @@ private:
     ros::NodeHandle& private_nh = getPrivateNodeHandle();
 
     private_nh.getParam("max_z", max_z_);
+    private_nh.getParam("enable_gesture_stop",enable_gesture_stop_);
     
     enabled_ = true;
+    gesture_tracking_enabled_ = false;
+    gesture_detected_ = false;
+    gesture_time_ = ros::Time::now();
 
     pointpub_ = private_nh.advertise<geometry_msgs::Point> ("goal", 1);
     markerpub_ = private_nh.advertise<visualization_msgs::Marker>("marker",1);
-    sub_= nh.subscribe<realsense_person::PersonDetection>("person/detection_data", 1, &RealSensePersonCoM::personcb, this);
+    person_detection_sub_= nh.subscribe<realsense_person::PersonDetection>("person/detection_data", 1, &RealSensePersonCoM::person_detection_cb, this);
+    person_tracking_sub_= nh.subscribe<realsense_person::PersonTracking>("person/tracking_data", 1, &RealSensePersonCoM::person_tracking_cb, this);
 
-    srvclient_ = nh.serviceClient<turtlebot_msgs::SetFollowState>("/turtlebot_follower/change_state"); 
+    turtlebot_state_srvclient_ = nh.serviceClient<turtlebot_msgs::SetFollowState>("/turtlebot_follower/change_state"); 
+    person_tracking_start_srvclient_ = nh.serviceClient<realsense_person::StartTracking>("person/start_tracking_person");
+    person_tracking_stop_srvclient_ = nh.serviceClient<realsense_person::StopTracking>("person/stop_tracking");
 
     config_srv_ = new dynamic_reconfigure::Server<realsense_person_turtlebot_follower::RealSensePersonCoMConfig>(private_nh);
     dynamic_reconfigure::Server<realsense_person_turtlebot_follower::RealSensePersonCoMConfig>::CallbackType f =
@@ -102,6 +117,7 @@ private:
   void reconfigure(realsense_person_turtlebot_follower::RealSensePersonCoMConfig &config, uint32_t level)
   {
     max_z_ = config.max_z;
+    enable_gesture_stop_ = config.enable_gesture_stop;
   }
 
   /*!
@@ -109,14 +125,33 @@ private:
    * Callback for person detection data. Extracts the person
    * Center of Mass from the data and publishes point messages
    * with this goal.
-   * @param person_msg The person detection message.
+   * @param person_detection_msg The person detection message.
    */
-  void personcb(const realsense_person::PersonDetectionConstPtr& person_msg)
+  void person_detection_cb(const realsense_person::PersonDetectionConstPtr& person_detection_msg)
   {
-    if(person_msg->detected_person_count > 0){
-      float x = person_msg->persons[0].center_of_mass.world.x;
-      float y = person_msg->persons[0].center_of_mass.world.y;
-      float z = person_msg->persons[0].center_of_mass.world.z;
+    if(person_detection_msg->detected_person_count > 0){
+      if(enable_gesture_stop_ && !gesture_tracking_enabled_){
+        // Start person tracking
+        realsense_person::StartTracking srv;
+        srv.request.tracking_id = person_detection_msg->persons[0].person_id.tracking_id;
+        if(person_tracking_start_srvclient_.call(srv)){
+          gesture_tracking_enabled_ = true;
+        }      
+      } else if(!enable_gesture_stop_ && gesture_tracking_enabled_){
+        // Stop person tracking
+        realsense_person::StopTracking srv;
+        if(person_tracking_stop_srvclient_.call(srv)){
+          gesture_tracking_enabled_ = false;
+        }
+      }
+      
+      if(gesture_detected_){
+        return;
+      }
+      
+      float x = person_detection_msg->persons[0].center_of_mass.world.x;
+      float y = person_detection_msg->persons[0].center_of_mass.world.y;
+      float z = person_detection_msg->persons[0].center_of_mass.world.z;
       
       // If outisde max_z limit
       if(z > max_z_){
@@ -152,6 +187,7 @@ private:
       }
       
     } else {
+      // Stop robot
       if(enabled_){
         ROS_INFO_THROTTLE(1, "No person detected, stopping the robot\n");
         if(setFollowerState(false)){
@@ -160,8 +196,62 @@ private:
           ROS_ERROR_THROTTLE(1, "Failed to stop Turtlebot Follower via change_state service");
         }
       }
+      // Stop person gesture tracking
+      gesture_tracking_enabled_ = false;
     }
     
+  }
+  
+  /*!
+   * @brief Callback for person tracking data.
+   * Callback for person tracking data. Extracts the person
+   * skeleton joint points from the data and determines
+   * if it should stop the robot.
+   * @param person_detection_msg The person detection message.
+   */
+  void person_tracking_cb(const realsense_person::PersonTrackingConstPtr& person_tracking_msg)
+  {
+    bool new_gesture_state = false;
+    
+    realsense_person::SkeletonJoint hand_left;
+    realsense_person::SkeletonJoint hand_right;
+    for(const realsense_person::SkeletonJoint& joint : person_tracking_msg->body.skeleton_joints){
+      if(joint.type == "joint_hand_left"){
+        hand_left = joint;
+      } else if(joint.type == "joint_hand_right"){
+        hand_right = joint;
+      }
+    }
+    
+    // If either hand is above the center of mass
+    if(hand_left.type != "" && hand_left.point.world.y < person_tracking_msg->person.center_of_mass.world.y){
+      new_gesture_state = true;
+    } else if(hand_right.type != "" && hand_right.point.world.y < person_tracking_msg->person.center_of_mass.world.y){
+      new_gesture_state = true;
+    }
+
+
+    if(new_gesture_state != gesture_detected_){
+      if(ros::Time::now().toSec() > (gesture_time_ + ros::Duration(gesture_change_duration_)).toSec()){
+        gesture_detected_ = new_gesture_state;
+        gesture_time_ = ros::Time::now();
+        
+        if(gesture_detected_){
+          // Stop robot
+          if(enabled_){
+            ROS_INFO_THROTTLE(1, "Gesture detected, stopping the robot\n");
+            if(setFollowerState(false)){
+              enabled_ = false;
+            } else {
+              ROS_ERROR_THROTTLE(1, "Failed to stop Turtlebot Follower via change_state service");
+            }
+          }
+        }
+        
+      }
+    } else {
+      gesture_time_ = ros::Time::now();
+    }
   }
 
   bool setFollowerState(bool follow)
@@ -172,7 +262,7 @@ private:
     } else {
       srv.request.state = srv.request.STOPPED;
     }
-    return srvclient_.call(srv);
+    return turtlebot_state_srvclient_.call(srv);
   }
 
   void publishMarker(double x,double y,double z)
@@ -202,10 +292,13 @@ private:
     markerpub_.publish( marker );
   }
 
-  ros::Subscriber sub_;
+  ros::Subscriber person_detection_sub_;
+  ros::Subscriber person_tracking_sub_;
   ros::Publisher pointpub_;
   ros::Publisher markerpub_;
-  ros::ServiceClient srvclient_;
+  ros::ServiceClient turtlebot_state_srvclient_;
+  ros::ServiceClient person_tracking_start_srvclient_;
+  ros::ServiceClient person_tracking_stop_srvclient_;
 };
 
 PLUGINLIB_DECLARE_CLASS(realsense_person_turtlebot_follower, RealSensePersonCoM, realsense_person_turtlebot_follower::RealSensePersonCoM, nodelet::Nodelet);
